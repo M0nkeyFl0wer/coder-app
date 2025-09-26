@@ -1,0 +1,8 @@
+streamlit
+pandas
+pydantic
+anthropic
+numpy
+scikit-learn
+openpyxl
+xlsxwriter
