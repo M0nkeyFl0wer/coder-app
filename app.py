@@ -1,8 +1,7 @@
 import streamlit as st
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError
-import anthropic
-from openai import OpenAI
+import requests
 from io import StringIO, BytesIO
 import json
 import numpy as np
@@ -82,53 +81,79 @@ def classify_response_prompt_multi(question, response, codebook_text):
     **Question:** "{question}" **Codebook:**\n---\n{codebook_text}\n--- **Response:** "{response}"
     **Instructions:** Return a list of all applicable code labels. If no codes apply, return an empty list."""
 
-def get_embeddings(texts: list[str], openai_api_key: str, model="text-embedding-3-small"):
-    # Use OpenAI for embeddings since Anthropic doesn't provide embeddings
-    if not openai_api_key:
-        # Fallback to random embeddings if no OpenAI key provided
+def get_embeddings(texts: list[str], unused_param: str = None, model="sentence-transformers"):
+    # Use local sentence-transformers for embeddings
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        embeddings = model.encode(texts)
+        return [emb.tolist() for emb in embeddings]
+    except ImportError:
+        st.warning("sentence-transformers not installed. Using random embeddings.")
+        # Fallback to random embeddings
         import numpy as np
         np.random.seed(42)
         return [np.random.rand(384).tolist() for _ in texts]
-    
-    client = OpenAI(api_key=openai_api_key)
-    response = client.embeddings.create(input=texts, model=model)
-    return [embedding.embedding for embedding in response.data]
 
-def call_claude_api(api_key, system_prompt, user_prompt, model="claude-3-5-sonnet-20241022", pydantic_model=None):
+def call_ollama_api(unused_api_key, system_prompt, user_prompt, model="qwen2.5:7b", pydantic_model=None):
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        # Ollama API endpoint (default local installation)
+        url = "http://localhost:11434/api/generate"
+        
+        # Combine system and user prompts
+        full_prompt = f"System: {system_prompt}\n\nUser: {user_prompt}"
+        
         if pydantic_model:
-            # Claude doesn't have structured output like OpenAI, so we'll request JSON format
-            json_prompt = f"{user_prompt}\n\nPlease respond with a valid JSON object that matches this schema: {pydantic_model.model_json_schema()}"
-            response = client.messages.create(
-                model=model,
-                max_tokens=4000,
-                temperature=0.0,
-                system=system_prompt,
-                messages=[{"role": "user", "content": json_prompt}]
-            )
-            try:
-                import json
-                json_content = response.content[0].text.strip()
-                # Extract JSON from response if it contains other text
-                if '{' in json_content:
-                    start = json_content.find('{')
-                    end = json_content.rfind('}') + 1
-                    json_content = json_content[start:end]
-                data = json.loads(json_content)
-                return pydantic_model.model_validate(data)
-            except Exception as e:
-                st.error(f"Failed to parse structured response: {e}")
+            # Request JSON format for structured output
+            json_prompt = f"{full_prompt}\n\nPlease respond with a valid JSON object that matches this schema: {pydantic_model.model_json_schema()}"
+            
+            payload = {
+                "model": model,
+                "prompt": json_prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0,
+                    "num_predict": 4000
+                }
+            }
+            
+            response = requests.post(url, json=payload)
+            if response.status_code == 200:
+                result = response.json()
+                try:
+                    json_content = result["response"].strip()
+                    # Extract JSON from response if it contains other text
+                    if '{' in json_content:
+                        start = json_content.find('{')
+                        end = json_content.rfind('}') + 1
+                        json_content = json_content[start:end]
+                    data = json.loads(json_content)
+                    return pydantic_model.model_validate(data)
+                except Exception as e:
+                    st.error(f"Failed to parse structured response: {e}")
+                    return None
+            else:
+                st.error(f"Ollama API error: {response.status_code}")
                 return None
         else:
-            response = client.messages.create(
-                model=model,
-                max_tokens=4000,
-                temperature=0.0,
-                system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}]
-            )
-            return response.content[0].text.strip()
+            payload = {
+                "model": model,
+                "prompt": full_prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.0,
+                    "num_predict": 4000
+                }
+            }
+            
+            response = requests.post(url, json=payload)
+            if response.status_code == 200:
+                result = response.json()
+                return result["response"].strip()
+            else:
+                st.error(f"Ollama API error: {response.status_code}")
+                return None
+                
     except Exception as e: 
         st.error(f"API Error: {e}")
         return None
@@ -248,11 +273,11 @@ def merge_codebooks_via_llm(api_key: str, base_cb: Codebook, new_cb: Codebook, m
         user_instructions
     ) + "\n\nReturn ONLY a JSON object with this exact schema: { \"codes\": [ { \"code\": string, \"description\": string, \"examples\": string[] } ] }"
     # First try structured parsing
-    merged = call_claude_api(api_key, system_msg, prompt, model=model, pydantic_model=Codebook)
+    merged = call_ollama_api(api_key, system_msg, prompt, model=model, pydantic_model=Codebook)
     if merged:
         return merged
     # Fallback to raw string and manual JSON parsing
-    raw = call_claude_api(api_key, system_msg, prompt, model=model, pydantic_model=None)
+    raw = call_ollama_api(api_key, system_msg, prompt, model=model, pydantic_model=None)
     if not raw:
         return None
     try:
@@ -268,10 +293,10 @@ def refine_codebook_via_instructions(api_key: str, current_cb: Codebook, instruc
     base_json = serialize_codebook_for_prompt(current_cb)
     prompt = f"""You are refining an existing survey codebook strictly following the user's instructions.
 Current codebook JSON:\n{base_json}\n\nInstructions:\n{instructions}\n\nReturn ONLY a JSON object with this exact schema: {{ \"codes\": [ {{ \"code\": string, \"description\": string, \"examples\": string[] }} ] }}. Do not add unrelated fields."""
-    refined = call_claude_api(api_key, system_msg, prompt, model=model, pydantic_model=Codebook)
+    refined = call_ollama_api(api_key, system_msg, prompt, model=model, pydantic_model=Codebook)
     if refined:
         return refined
-    raw = call_claude_api(api_key, system_msg, prompt, model=model, pydantic_model=None)
+    raw = call_ollama_api(api_key, system_msg, prompt, model=model, pydantic_model=None)
     if not raw:
         return None
     try:
@@ -288,15 +313,27 @@ st.markdown("Generate, refine, merge, and efficiently classify survey data with 
 
 with st.sidebar:
     st.header("1. Setup")
-    api_key_input = st.text_input("Enter your Anthropic API Key", type="password")
-    openai_key_input = st.text_input("Enter your OpenAI API Key (for embeddings only)", type="password", help="Only used for semantic clustering embeddings")
-    if api_key_input: st.session_state.api_key = api_key_input
-    if openai_key_input: st.session_state.openai_key = openai_key_input
+    st.info("🤖 Using Local Ollama (No API key needed)")
+    # Check if Ollama is running
+    try:
+        response = requests.get("http://localhost:11434/api/tags", timeout=2)
+        if response.status_code == 200:
+            models = response.json().get("models", [])
+            if models:
+                st.success(f"✅ Ollama connected! {len(models)} models available")
+            else:
+                st.warning("⚠️ Ollama connected but no models found. Run: ollama pull qwen2.5:7b")
+        else:
+            st.error("❌ Ollama not responding")
+    except:
+        st.error("❌ Ollama not running. Install and start Ollama first.")
+    
+    st.session_state.api_key = "local"  # Dummy value since Ollama doesn't need API keys
     uploaded_file = st.file_uploader("Upload survey data", type=['csv', 'xlsx'])
     if uploaded_file and st.session_state.df is None:
-        initialize_state(); st.session_state.api_key = api_key_input; st.session_state.df = load_data(uploaded_file)
+        initialize_state(); st.session_state.api_key = "local"; st.session_state.df = load_data(uploaded_file)
 
-if not st.session_state.api_key: st.warning("Please enter your Anthropic API key.")
+if not st.session_state.api_key: st.warning("Ollama setup required.")
 elif st.session_state.df is None: st.info("Please upload a CSV or Excel file.")
 else:
     # (Sections 2 and 3 are unchanged)
@@ -321,7 +358,7 @@ else:
         st.session_state.column_to_code = column_to_code
         st.session_state.question_text = st.text_area("Edit the question text:", value=column_to_code, height=100)
     with col_config_2:
-        generation_model = st.selectbox("Select Model for Codebook Generation:", ["claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"], help="A powerful model is recommended for generation and merging.")
+        generation_model = st.selectbox("Select Model for Codebook Generation:", ["qwen2.5:7b", "llama3.2:3b", "phi3:mini"], help="A powerful model is recommended for generation and merging.")
         num_examples = st.slider("Examples for initial codebook:", 10, 600, 150, 10)
 
     st.divider()
@@ -340,7 +377,7 @@ else:
         examples = df[column_to_code].dropna().unique().tolist()[:num_examples]
         with st.spinner("AI is analyzing responses and generating your codebook..."):
             prompt = generate_structured_codebook_prompt(st.session_state.question_text, examples)
-            codebook_object = call_claude_api(st.session_state.api_key, "You are an expert survey analyst.", prompt, generation_model, pydantic_model=Codebook)
+            codebook_object = call_ollama_api(st.session_state.api_key, "You are an expert survey analyst.", prompt, generation_model, pydantic_model=Codebook)
             if codebook_object: st.session_state.structured_codebook = codebook_object; st.success("Initial codebook generated!")
 
     if st.session_state.structured_codebook:
@@ -431,7 +468,7 @@ else:
                         actual_sample_size = min(len(all_unique_responses), refine_sample_size)
                         new_examples = pd.Series(all_unique_responses).sample(n=actual_sample_size, replace=False).tolist()
                         new_prompt = generate_structured_codebook_prompt(st.session_state.question_text, new_examples)
-                        new_codebook = call_claude_api(st.session_state.api_key, "You are an expert survey analyst.", new_prompt, generation_model, pydantic_model=Codebook)
+                        new_codebook = call_ollama_api(st.session_state.api_key, "You are an expert survey analyst.", new_prompt, generation_model, pydantic_model=Codebook)
                         if not new_codebook:
                             st.error("Failed to generate the refinement codebook.")
                         else:
@@ -452,7 +489,7 @@ else:
         
         st.divider()
         st.header("4. Classify All Responses")
-        classification_model = st.selectbox("Select Model for Final Classification:", ["claude-3-5-haiku-20241022", "claude-3-5-sonnet-20241022"], index=0)
+        classification_model = st.selectbox("Select Model for Final Classification:", ["qwen2.5:7b", "llama3.2:3b"], index=0)
         
         # --- NEW: Checkboxes for classification mode ---
         col_mode_1, col_mode_2 = st.columns(2)
@@ -483,17 +520,17 @@ else:
                 def classify_item(response):
                     if use_multilabel:
                         prompt = classify_response_prompt_multi(st.session_state.question_text, response, final_codebook_text)
-                        result = call_claude_api(st.session_state.api_key, "You are a multi-label survey coding assistant.", prompt, model=classification_model, pydantic_model=ClassificationResult)
+                        result = call_ollama_api(st.session_state.api_key, "You are a multi-label survey coding assistant.", prompt, model=classification_model, pydantic_model=ClassificationResult)
                         if result and result.assigned_codes:
                             return " | ".join(result.assigned_codes) # Join list into a string
                         return "No Code Applied" if result else "API_ERROR"
                     else: # Single-label path
                         prompt = classify_response_prompt(st.session_state.question_text, response, final_codebook_text)
-                        return call_claude_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=classification_model) or "API_ERROR"
+                        return call_ollama_api(st.session_state.api_key, "You are a survey coding assistant.", prompt, model=classification_model) or "API_ERROR"
 
                 if use_clustering and len(unique_responses) > 1:
                     # (Clustering logic remains the same, but now calls the unified classify_item function)
-                    progress_bar.progress(5, text="Step 1/4: Generating embeddings..."); embeddings = get_embeddings(unique_responses, st.session_state.get('openai_key', ''))
+                    progress_bar.progress(5, text="Step 1/4: Generating embeddings..."); embeddings = get_embeddings(unique_responses)
                     if not embeddings: st.error("Failed to generate embeddings."); st.stop()
                     progress_bar.progress(15, text="Step 2/4: Clustering responses..."); embeddings = normalize(np.array(embeddings)); db = DBSCAN(eps=0.3, min_samples=2, metric='cosine').fit(embeddings); labels = db.labels_
                     cluster_ids = set(labels); n_clusters = len(cluster_ids) - (1 if -1 in labels else 0); outliers = [response for response, label in zip(unique_responses, labels) if label == -1]; n_outliers = len(outliers)

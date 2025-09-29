@@ -1,8 +1,8 @@
 streamlit
 pandas
 pydantic
-anthropic
-openai
+requests
+sentence-transformers
 numpy
 scikit-learn
 openpyxl
