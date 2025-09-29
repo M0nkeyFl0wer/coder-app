@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from pydantic import BaseModel, Field, ValidationError
 import anthropic
+from openai import OpenAI
 from io import StringIO, BytesIO
 import json
 import numpy as np
@@ -27,7 +28,7 @@ st.set_page_config(page_title="Intelligent Survey Coder", page_icon="🧠", layo
 # --- State Management ---
 def initialize_state():
     for key, value in {
-        'api_key': None, 'df': None, 'structured_codebook': None,
+        'api_key': None, 'openai_key': None, 'df': None, 'structured_codebook': None,
         'classified_df': None, 'question_text': "", 'initial_sample_size': 0
     }.items():
         if key not in st.session_state: st.session_state[key] = value
@@ -81,13 +82,17 @@ def classify_response_prompt_multi(question, response, codebook_text):
     **Question:** "{question}" **Codebook:**\n---\n{codebook_text}\n--- **Response:** "{response}"
     **Instructions:** Return a list of all applicable code labels. If no codes apply, return an empty list."""
 
-def get_embeddings(texts: list[str], api_key: str, model="text-embedding-3-small"):
-    # Note: Anthropic doesn't provide embeddings directly
-    # You'll need to use a different service like OpenAI, Cohere, or local embeddings
-    # For now, we'll use a simple fallback that creates random embeddings for demo purposes
-    import numpy as np
-    np.random.seed(42)  # For reproducible results
-    return [np.random.rand(384).tolist() for _ in texts]
+def get_embeddings(texts: list[str], openai_api_key: str, model="text-embedding-3-small"):
+    # Use OpenAI for embeddings since Anthropic doesn't provide embeddings
+    if not openai_api_key:
+        # Fallback to random embeddings if no OpenAI key provided
+        import numpy as np
+        np.random.seed(42)
+        return [np.random.rand(384).tolist() for _ in texts]
+    
+    client = OpenAI(api_key=openai_api_key)
+    response = client.embeddings.create(input=texts, model=model)
+    return [embedding.embedding for embedding in response.data]
 
 def call_claude_api(api_key, system_prompt, user_prompt, model="claude-3-5-sonnet-20241022", pydantic_model=None):
     try:
@@ -284,7 +289,9 @@ st.markdown("Generate, refine, merge, and efficiently classify survey data with 
 with st.sidebar:
     st.header("1. Setup")
     api_key_input = st.text_input("Enter your Anthropic API Key", type="password")
+    openai_key_input = st.text_input("Enter your OpenAI API Key (for embeddings only)", type="password", help="Only used for semantic clustering embeddings")
     if api_key_input: st.session_state.api_key = api_key_input
+    if openai_key_input: st.session_state.openai_key = openai_key_input
     uploaded_file = st.file_uploader("Upload survey data", type=['csv', 'xlsx'])
     if uploaded_file and st.session_state.df is None:
         initialize_state(); st.session_state.api_key = api_key_input; st.session_state.df = load_data(uploaded_file)
@@ -486,7 +493,7 @@ else:
 
                 if use_clustering and len(unique_responses) > 1:
                     # (Clustering logic remains the same, but now calls the unified classify_item function)
-                    progress_bar.progress(5, text="Step 1/4: Generating embeddings..."); embeddings = get_embeddings(unique_responses, st.session_state.api_key)
+                    progress_bar.progress(5, text="Step 1/4: Generating embeddings..."); embeddings = get_embeddings(unique_responses, st.session_state.get('openai_key', ''))
                     if not embeddings: st.error("Failed to generate embeddings."); st.stop()
                     progress_bar.progress(15, text="Step 2/4: Clustering responses..."); embeddings = normalize(np.array(embeddings)); db = DBSCAN(eps=0.3, min_samples=2, metric='cosine').fit(embeddings); labels = db.labels_
                     cluster_ids = set(labels); n_clusters = len(cluster_ids) - (1 if -1 in labels else 0); outliers = [response for response, label in zip(unique_responses, labels) if label == -1]; n_outliers = len(outliers)
